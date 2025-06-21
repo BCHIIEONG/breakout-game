@@ -73,10 +73,57 @@ const UNBREAKABLE_BRICK_COLOR: Color = Color::rgb(0.3, 0.3, 0.3);
 enum GameState {
     #[default]
     MainMenu,
+    DifficultySelect,
     Playing,
     GameOver,
     Victory,
     NextLevel,
+}
+
+// 难度等级
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Difficulty {
+    Easy,
+    Medium,
+    Hard,
+}
+
+// 难度设置
+#[derive(Resource)]
+struct DifficultySettings {
+    difficulty: Difficulty,
+    lives: u32,
+    ball_speed_modifier: f32,
+    reset_lives_on_level: bool,
+    time_limit: Option<f32>, // 困难模式的时间限制（秒）
+}
+
+impl DifficultySettings {
+    fn new(difficulty: Difficulty) -> Self {
+        match difficulty {
+            Difficulty::Easy => Self {
+                difficulty,
+                lives: 5,
+                ball_speed_modifier: 0.8,
+                reset_lives_on_level: true,
+                time_limit: None,
+            },
+            Difficulty::Medium => Self {
+                difficulty,
+                lives: 3,
+                ball_speed_modifier: 1.0,
+                reset_lives_on_level: false,
+                time_limit: None,
+            },
+            Difficulty::Hard => Self {
+                difficulty,
+                lives: 3,
+                ball_speed_modifier: 1.3,
+                reset_lives_on_level: false,
+                time_limit: Some(180.0), // 3分钟每关
+            },
+        }
+    }
 }
 
 // 组件定义
@@ -134,7 +181,13 @@ struct LevelText;
 struct LivesText;
 
 #[derive(Component)]
+struct TimerText;
+
+#[derive(Component)]
 struct MainMenuUI;
+
+#[derive(Component)]
+struct DifficultyUI;
 
 #[derive(Component)]
 struct GameOverUI;
@@ -151,6 +204,9 @@ struct Level(u32);
 
 #[derive(Resource)]
 struct Lives(u32);
+
+#[derive(Resource)]
+struct LevelTimer(f32);
 
 #[derive(Resource)]
 struct PowerUpEffects {
@@ -194,11 +250,17 @@ fn main() {
         .insert_resource(Score(0))
         .insert_resource(Level(1))
         .insert_resource(Lives(3))
+        .insert_resource(LevelTimer(0.0))
         .insert_resource(PowerUpEffects::default())
+        .insert_resource(DifficultySettings::new(Difficulty::Medium))
         // 菜单系统
         .add_systems(OnEnter(GameState::MainMenu), setup_main_menu)
         .add_systems(Update, main_menu_system.run_if(in_state(GameState::MainMenu)))
         .add_systems(OnExit(GameState::MainMenu), cleanup_main_menu)
+        // 难度选择系统
+        .add_systems(OnEnter(GameState::DifficultySelect), setup_difficulty_menu)
+        .add_systems(Update, difficulty_menu_system.run_if(in_state(GameState::DifficultySelect)))
+        .add_systems(OnExit(GameState::DifficultySelect), cleanup_difficulty_menu)
         // 游戏系统
         .add_systems(OnEnter(GameState::Playing), setup_game)
         .add_systems(
@@ -211,6 +273,7 @@ fn main() {
                 powerup_collision,
                 particle_system,
                 update_powerup_timers,
+                update_level_timer,
                 check_victory,
                 update_ui,
             )
@@ -292,7 +355,7 @@ fn main_menu_system(
     mut next_state: ResMut<NextState<GameState>>,
 ) {
     if keyboard_input.just_pressed(KeyCode::Space) {
-        next_state.set(GameState::Playing);
+        next_state.set(GameState::DifficultySelect);
     }
 }
 
@@ -303,17 +366,134 @@ fn cleanup_main_menu(mut commands: Commands, query: Query<Entity, With<MainMenuU
     }
 }
 
+// 设置难度选择菜单
+fn setup_difficulty_menu(mut commands: Commands) {
+    commands
+        .spawn((
+            NodeBundle {
+                style: Style {
+                    width: Val::Percent(100.0),
+                    height: Val::Percent(100.0),
+                    flex_direction: FlexDirection::Column,
+                    justify_content: JustifyContent::Center,
+                    align_items: AlignItems::Center,
+                    ..default()
+                },
+                background_color: BackgroundColor(Color::rgb(0.1, 0.1, 0.15)),
+                ..default()
+            },
+            DifficultyUI,
+        ))
+        .with_children(|parent| {
+            parent.spawn(TextBundle::from_section(
+                "SELECT DIFFICULTY",
+                TextStyle {
+                    font_size: 60.0,
+                    color: Color::WHITE,
+                    ..default()
+                },
+            ));
+            
+            parent.spawn(TextBundle::from_section(
+                "[1] EASY - 5 Lives, Slower Ball, Lives Reset Each Level",
+                TextStyle {
+                    font_size: 25.0,
+                    color: Color::rgb(0.2, 0.8, 0.2),
+                    ..default()
+                },
+            ).with_style(Style {
+                margin: UiRect::top(Val::Px(50.0)),
+                ..default()
+            }));
+
+            parent.spawn(TextBundle::from_section(
+                "[2] MEDIUM - 3 Lives, Normal Speed",
+                TextStyle {
+                    font_size: 25.0,
+                    color: Color::rgb(0.8, 0.8, 0.2),
+                    ..default()
+                },
+            ).with_style(Style {
+                margin: UiRect::top(Val::Px(20.0)),
+                ..default()
+            }));
+
+            parent.spawn(TextBundle::from_section(
+                "[3] HARD - 3 Lives, Faster Ball, Time Limit, No Life Reset",
+                TextStyle {
+                    font_size: 25.0,
+                    color: Color::rgb(0.8, 0.2, 0.2),
+                    ..default()
+                },
+            ).with_style(Style {
+                margin: UiRect::top(Val::Px(20.0)),
+                ..default()
+            }));
+
+            parent.spawn(TextBundle::from_section(
+                "Press 1, 2, or 3 to select",
+                TextStyle {
+                    font_size: 20.0,
+                    color: Color::rgb(0.6, 0.6, 0.6),
+                    ..default()
+                },
+            ).with_style(Style {
+                margin: UiRect::top(Val::Px(50.0)),
+                ..default()
+            }));
+        });
+}
+
+// 难度选择系统
+fn difficulty_menu_system(
+    keyboard_input: Res<ButtonInput<KeyCode>>,
+    mut next_state: ResMut<NextState<GameState>>,
+    mut difficulty_settings: ResMut<DifficultySettings>,
+    mut lives: ResMut<Lives>,
+) {
+    if keyboard_input.just_pressed(KeyCode::Digit1) || keyboard_input.just_pressed(KeyCode::Numpad1) {
+        *difficulty_settings = DifficultySettings::new(Difficulty::Easy);
+        lives.0 = difficulty_settings.lives;
+        next_state.set(GameState::Playing);
+    } else if keyboard_input.just_pressed(KeyCode::Digit2) || keyboard_input.just_pressed(KeyCode::Numpad2) {
+        *difficulty_settings = DifficultySettings::new(Difficulty::Medium);
+        lives.0 = difficulty_settings.lives;
+        next_state.set(GameState::Playing);
+    } else if keyboard_input.just_pressed(KeyCode::Digit3) || keyboard_input.just_pressed(KeyCode::Numpad3) {
+        *difficulty_settings = DifficultySettings::new(Difficulty::Hard);
+        lives.0 = difficulty_settings.lives;
+        next_state.set(GameState::Playing);
+    }
+}
+
+// 清理难度选择菜单
+fn cleanup_difficulty_menu(mut commands: Commands, query: Query<Entity, With<DifficultyUI>>) {
+    for entity in query.iter() {
+        commands.entity(entity).despawn_recursive();
+    }
+}
+
 // 设置游戏
 fn setup_game(
     mut commands: Commands,
     mut score: ResMut<Score>,
     mut lives: ResMut<Lives>,
+    mut level_timer: ResMut<LevelTimer>,
     level: Res<Level>,
+    difficulty_settings: Res<DifficultySettings>,
 ) {
     // 重置分数和生命（新游戏时）
     if level.0 == 1 {
         score.0 = 0;
-        lives.0 = 3;
+        lives.0 = difficulty_settings.lives;
+    } else if difficulty_settings.reset_lives_on_level {
+        // Easy模式下每关重置生命
+        lives.0 = difficulty_settings.lives;
+    }
+
+    // 重置计时器
+    if let Some(time_limit) = difficulty_settings.time_limit {
+        level_timer.0 = time_limit;
     }
 
     // 创建相机
@@ -357,7 +537,7 @@ fn setup_game(
             ..default()
         },
         Ball {
-            velocity: ball_direction * BALL_SPEED,
+            velocity: ball_direction * BALL_SPEED * difficulty_settings.ball_speed_modifier,
         },
     ));
 
@@ -365,7 +545,7 @@ fn setup_game(
     spawn_bricks(&mut commands, level.0);
 
     // UI
-    setup_ui(&mut commands);
+    setup_ui(&mut commands, &difficulty_settings);
 }
 
 // 生成砖块
@@ -434,7 +614,7 @@ fn spawn_bricks(commands: &mut Commands, level: u32) {
 }
 
 // 设置UI
-fn setup_ui(commands: &mut Commands) {
+fn setup_ui(commands: &mut Commands, difficulty_settings: &DifficultySettings) {
     // 分数文本
     commands.spawn((
         TextBundle::from_section(
@@ -491,6 +671,27 @@ fn setup_ui(commands: &mut Commands) {
         }),
         LivesText,
     ));
+
+    // 如果是困难模式，添加计时器文本
+    if difficulty_settings.difficulty == Difficulty::Hard {
+        commands.spawn((
+            TextBundle::from_section(
+                "Time: 180",
+                TextStyle {
+                    font_size: 30.0,
+                    color: Color::rgb(0.8, 0.2, 0.2),
+                    ..default()
+                },
+            )
+            .with_style(Style {
+                position_type: PositionType::Absolute,
+                left: Val::Px(WINDOW_WIDTH / 2.0 - 50.0),
+                top: Val::Px(50.0),
+                ..default()
+            }),
+            TimerText,
+        ));
+    }
 }
 
 // 更新UI
@@ -498,9 +699,12 @@ fn update_ui(
     score: Res<Score>,
     level: Res<Level>,
     lives: Res<Lives>,
-    mut score_query: Query<&mut Text, (With<ScoreText>, Without<LevelText>, Without<LivesText>)>,
-    mut level_query: Query<&mut Text, (With<LevelText>, Without<ScoreText>, Without<LivesText>)>,
-    mut lives_query: Query<&mut Text, (With<LivesText>, Without<ScoreText>, Without<LevelText>)>,
+    level_timer: Res<LevelTimer>,
+    difficulty_settings: Res<DifficultySettings>,
+    mut score_query: Query<&mut Text, (With<ScoreText>, Without<LevelText>, Without<LivesText>, Without<TimerText>)>,
+    mut level_query: Query<&mut Text, (With<LevelText>, Without<ScoreText>, Without<LivesText>, Without<TimerText>)>,
+    mut lives_query: Query<&mut Text, (With<LivesText>, Without<ScoreText>, Without<LevelText>, Without<TimerText>)>,
+    mut timer_query: Query<&mut Text, (With<TimerText>, Without<ScoreText>, Without<LevelText>, Without<LivesText>)>,
 ) {
     if let Ok(mut text) = score_query.get_single_mut() {
         text.sections[0].value = format!("Score: {}", score.0);
@@ -510,6 +714,31 @@ fn update_ui(
     }
     if let Ok(mut text) = lives_query.get_single_mut() {
         text.sections[0].value = format!("Lives: {}", lives.0);
+    }
+    
+    // 更新计时器文本（仅限困难模式）
+    if difficulty_settings.difficulty == Difficulty::Hard {
+        if let Ok(mut text) = timer_query.get_single_mut() {
+            text.sections[0].value = format!("Time: {}", level_timer.0.ceil() as i32);
+        }
+    }
+}
+
+// 更新关卡计时器
+fn update_level_timer(
+    time: Res<Time>,
+    mut level_timer: ResMut<LevelTimer>,
+    difficulty_settings: Res<DifficultySettings>,
+    mut next_state: ResMut<NextState<GameState>>,
+) {
+    if difficulty_settings.difficulty == Difficulty::Hard {
+        if level_timer.0 > 0.0 {
+            level_timer.0 -= time.delta_seconds();
+            if level_timer.0 <= 0.0 {
+                level_timer.0 = 0.0;
+                next_state.set(GameState::GameOver);
+            }
+        }
     }
 }
 
@@ -545,9 +774,10 @@ fn ball_movement(
     mut ball_query: Query<(&mut Transform, &Ball)>,
     time: Res<Time>,
     power_effects: Res<PowerUpEffects>,
+    difficulty_settings: Res<DifficultySettings>,
 ) {
     for (mut transform, ball) in ball_query.iter_mut() {
-        let velocity = ball.velocity * power_effects.ball_speed_modifier;
+        let velocity = ball.velocity * power_effects.ball_speed_modifier * difficulty_settings.ball_speed_modifier;
         transform.translation += velocity.extend(0.0) * time.delta_seconds();
     }
 }
@@ -562,6 +792,7 @@ fn ball_collision(
     mut lives: ResMut<Lives>,
     mut next_state: ResMut<NextState<GameState>>,
     power_effects: Res<PowerUpEffects>,
+    difficulty_settings: Res<DifficultySettings>,
 ) {
     let paddle_transform = paddle_query.single();
     let paddle_width = PADDLE_SIZE.x * power_effects.paddle_size_modifier;
@@ -595,7 +826,7 @@ fn ball_collision(
                 ball.velocity = Vec2::new(
                     if rand::random() { 1.0 } else { -1.0 },
                     1.0,
-                ).normalize() * BALL_SPEED;
+                ).normalize() * BALL_SPEED * difficulty_settings.ball_speed_modifier;
             }
         }
 
@@ -924,7 +1155,13 @@ fn cleanup_game(
 }
 
 // 游戏结束界面
-fn setup_game_over(mut commands: Commands, score: Res<Score>) {
+fn setup_game_over(mut commands: Commands, score: Res<Score>, difficulty_settings: Res<DifficultySettings>) {
+    let difficulty_text = match difficulty_settings.difficulty {
+        Difficulty::Easy => "EASY",
+        Difficulty::Medium => "MEDIUM",
+        Difficulty::Hard => "HARD",
+    };
+
     commands
         .spawn((
             NodeBundle {
@@ -952,7 +1189,7 @@ fn setup_game_over(mut commands: Commands, score: Res<Score>) {
             ));
             
             parent.spawn(TextBundle::from_section(
-                format!("Final Score: {}", score.0),
+                format!("Final Score: {} ({})", score.0, difficulty_text),
                 TextStyle {
                     font_size: 40.0,
                     color: Color::WHITE,
