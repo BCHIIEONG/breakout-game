@@ -60,6 +60,10 @@ const BRICK_ROWS: usize = 6;
 const BRICK_COLUMNS: usize = 10;
 const GAP_SIZE: f32 = 5.0;
 
+// 激光设置
+const LASER_SIZE: Vec2 = Vec2::new(5.0, 20.0);
+const LASER_SPEED: f32 = 600.0;
+
 // 颜色定义
 const BACKGROUND_COLOR: Color = Color::rgb(0.1, 0.1, 0.15);
 const PADDLE_COLOR: Color = Color::rgb(0.3, 0.7, 1.0);
@@ -67,6 +71,7 @@ const BALL_COLOR: Color = Color::rgb(1.0, 0.9, 0.7);
 const NORMAL_BRICK_COLOR: Color = Color::rgb(0.8, 0.3, 0.3);
 const HARD_BRICK_COLOR: Color = Color::rgb(0.5, 0.2, 0.2);
 const UNBREAKABLE_BRICK_COLOR: Color = Color::rgb(0.3, 0.3, 0.3);
+const LASER_COLOR: Color = Color::rgb(1.0, 0.2, 0.2);
 
 // 游戏状态
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Hash, States)]
@@ -75,6 +80,7 @@ enum GameState {
     MainMenu,
     DifficultySelect,
     Playing,
+    Paused,
     GameOver,
     Victory,
     NextLevel,
@@ -94,6 +100,7 @@ struct DifficultySettings {
     difficulty: Difficulty,
     lives: u32,
     ball_speed_modifier: f32,
+    paddle_speed_modifier: f32,
     reset_lives_on_level: bool,
     time_limit: Option<f32>, // 困难模式的时间限制（秒）
 }
@@ -105,6 +112,7 @@ impl DifficultySettings {
                 difficulty,
                 lives: 5,
                 ball_speed_modifier: 0.8,
+                paddle_speed_modifier: 1.0,
                 reset_lives_on_level: true,
                 time_limit: None,
             },
@@ -112,6 +120,7 @@ impl DifficultySettings {
                 difficulty,
                 lives: 3,
                 ball_speed_modifier: 1.0,
+                paddle_speed_modifier: 1.20,  // 稍微加快挡板速度
                 reset_lives_on_level: false,
                 time_limit: None,
             },
@@ -119,12 +128,17 @@ impl DifficultySettings {
                 difficulty,
                 lives: 3,
                 ball_speed_modifier: 1.3,
+                paddle_speed_modifier: 1.8,   // 更快的挡板速度
                 reset_lives_on_level: false,
                 time_limit: Some(180.0), // 3分钟每关
             },
         }
     }
 }
+
+// 游戏初始化状态
+#[derive(Resource)]
+struct GameInitialized(bool);
 
 // 组件定义
 #[derive(Component)]
@@ -166,6 +180,11 @@ enum PowerUpType {
 }
 
 #[derive(Component)]
+struct Laser {
+    velocity: Vec2,
+}
+
+#[derive(Component)]
 struct Particle {
     velocity: Vec2,
     lifetime: f32,
@@ -184,6 +203,9 @@ struct LivesText;
 struct TimerText;
 
 #[derive(Component)]
+struct LaserText;
+
+#[derive(Component)]
 struct MainMenuUI;
 
 #[derive(Component)]
@@ -194,6 +216,12 @@ struct GameOverUI;
 
 #[derive(Component)]
 struct VictoryUI;
+
+#[derive(Component)]
+struct PauseUI;
+
+#[derive(Component)]
+struct GameEntity;
 
 // 资源定义
 #[derive(Resource)]
@@ -253,6 +281,7 @@ fn main() {
         .insert_resource(LevelTimer(0.0))
         .insert_resource(PowerUpEffects::default())
         .insert_resource(DifficultySettings::new(Difficulty::Medium))
+        .insert_resource(GameInitialized(false))
         // 菜单系统
         .add_systems(OnEnter(GameState::MainMenu), setup_main_menu)
         .add_systems(Update, main_menu_system.run_if(in_state(GameState::MainMenu)))
@@ -262,7 +291,7 @@ fn main() {
         .add_systems(Update, difficulty_menu_system.run_if(in_state(GameState::DifficultySelect)))
         .add_systems(OnExit(GameState::DifficultySelect), cleanup_difficulty_menu)
         // 游戏系统
-        .add_systems(OnEnter(GameState::Playing), setup_game)
+        .add_systems(OnEnter(GameState::Playing), setup_game_conditional)
         .add_systems(
             Update,
             (
@@ -276,12 +305,19 @@ fn main() {
                 update_level_timer,
                 check_victory,
                 update_ui,
+                pause_game_input,
+                laser_shooting,
+                laser_movement,
+                laser_collision,
             )
                 .run_if(in_state(GameState::Playing)),
         )
-        .add_systems(OnExit(GameState::Playing), cleanup_game)
+        // 暂停系统
+        .add_systems(OnEnter(GameState::Paused), setup_pause_menu)
+        .add_systems(Update, pause_menu_system.run_if(in_state(GameState::Paused)))
+        .add_systems(OnExit(GameState::Paused), cleanup_pause_menu)
         // 游戏结束系统
-        .add_systems(OnEnter(GameState::GameOver), setup_game_over)
+        .add_systems(OnEnter(GameState::GameOver), (cleanup_game, setup_game_over))
         .add_systems(Update, game_over_system.run_if(in_state(GameState::GameOver)))
         .add_systems(OnExit(GameState::GameOver), cleanup_game_over)
         // 胜利系统
@@ -294,7 +330,8 @@ fn main() {
 }
 
 // 设置主菜单
-fn setup_main_menu(mut commands: Commands) {
+fn setup_main_menu(mut commands: Commands, mut game_initialized: ResMut<GameInitialized>) {
+    game_initialized.0 = false; // 重置游戏初始化状态
     commands.spawn(Camera2dBundle::default());
 
     commands
@@ -336,7 +373,7 @@ fn setup_main_menu(mut commands: Commands) {
             }));
 
             parent.spawn(TextBundle::from_section(
-                "Controls:\nInput keyboard left and right keys or A D to move paddle\nCollect power-ups for special abilities",
+                "Controls:\nArrow Keys or A/D: Move paddle\nSPACE: Shoot laser (when available)\nESC: Pause game\nCollect power-ups for special abilities",
                 TextStyle {
                     font_size: 20.0,
                     color: Color::rgb(0.6, 0.6, 0.6),
@@ -407,7 +444,7 @@ fn setup_difficulty_menu(mut commands: Commands) {
             }));
 
             parent.spawn(TextBundle::from_section(
-                "[2] MEDIUM - 3 Lives, Normal Speed",
+                "[2] MEDIUM - 3 Lives, Normal Ball, Faster Paddle",
                 TextStyle {
                     font_size: 25.0,
                     color: Color::rgb(0.8, 0.8, 0.2),
@@ -419,7 +456,7 @@ fn setup_difficulty_menu(mut commands: Commands) {
             }));
 
             parent.spawn(TextBundle::from_section(
-                "[3] HARD - 3 Lives, Faster Ball, Time Limit, No Life Reset",
+                "[3] HARD - 3 Lives, Very Fast Ball & Paddle, Time Limit",
                 TextStyle {
                     font_size: 25.0,
                     color: Color::rgb(0.8, 0.2, 0.2),
@@ -473,6 +510,22 @@ fn cleanup_difficulty_menu(mut commands: Commands, query: Query<Entity, With<Dif
     }
 }
 
+// 条件性设置游戏
+fn setup_game_conditional(
+    commands: Commands,
+    score: ResMut<Score>,
+    lives: ResMut<Lives>,
+    level_timer: ResMut<LevelTimer>,
+    level: Res<Level>,
+    difficulty_settings: Res<DifficultySettings>,
+    mut game_initialized: ResMut<GameInitialized>,
+) {
+    if !game_initialized.0 {
+        setup_game(commands, score, lives, level_timer, level, difficulty_settings);
+        game_initialized.0 = true;
+    }
+}
+
 // 设置游戏
 fn setup_game(
     mut commands: Commands,
@@ -514,6 +567,7 @@ fn setup_game(
             ..default()
         },
         Paddle,
+        GameEntity,
     ));
 
     // 创建球
@@ -539,6 +593,7 @@ fn setup_game(
         Ball {
             velocity: ball_direction * BALL_SPEED * difficulty_settings.ball_speed_modifier,
         },
+        GameEntity,
     ));
 
     // 创建砖块
@@ -608,6 +663,7 @@ fn spawn_bricks(commands: &mut Commands, level: u32) {
                     ..default()
                 },
                 Brick { brick_type, health },
+                GameEntity,
             ));
         }
     }
@@ -632,6 +688,7 @@ fn setup_ui(commands: &mut Commands, difficulty_settings: &DifficultySettings) {
             ..default()
         }),
         ScoreText,
+        GameEntity,
     ));
 
     // 关卡文本
@@ -651,6 +708,7 @@ fn setup_ui(commands: &mut Commands, difficulty_settings: &DifficultySettings) {
             ..default()
         }),
         LevelText,
+        GameEntity,
     ));
 
     // 生命文本
@@ -670,6 +728,7 @@ fn setup_ui(commands: &mut Commands, difficulty_settings: &DifficultySettings) {
             ..default()
         }),
         LivesText,
+        GameEntity,
     ));
 
     // 如果是困难模式，添加计时器文本
@@ -690,8 +749,29 @@ fn setup_ui(commands: &mut Commands, difficulty_settings: &DifficultySettings) {
                 ..default()
             }),
             TimerText,
+            GameEntity,
         ));
     }
+
+    // 激光状态文本
+    commands.spawn((
+        TextBundle::from_section(
+            "",
+            TextStyle {
+                font_size: 25.0,
+                color: Color::rgb(0.2, 0.8, 0.8),
+                ..default()
+            },
+        )
+        .with_style(Style {
+            position_type: PositionType::Absolute,
+            left: Val::Px(10.0),
+            bottom: Val::Px(10.0),
+            ..default()
+        }),
+        LaserText,
+        GameEntity,
+    ));
 }
 
 // 更新UI
@@ -700,11 +780,13 @@ fn update_ui(
     level: Res<Level>,
     lives: Res<Lives>,
     level_timer: Res<LevelTimer>,
+    power_effects: Res<PowerUpEffects>,
     difficulty_settings: Res<DifficultySettings>,
-    mut score_query: Query<&mut Text, (With<ScoreText>, Without<LevelText>, Without<LivesText>, Without<TimerText>)>,
-    mut level_query: Query<&mut Text, (With<LevelText>, Without<ScoreText>, Without<LivesText>, Without<TimerText>)>,
-    mut lives_query: Query<&mut Text, (With<LivesText>, Without<ScoreText>, Without<LevelText>, Without<TimerText>)>,
-    mut timer_query: Query<&mut Text, (With<TimerText>, Without<ScoreText>, Without<LevelText>, Without<LivesText>)>,
+    mut score_query: Query<&mut Text, (With<ScoreText>, Without<LevelText>, Without<LivesText>, Without<TimerText>, Without<LaserText>)>,
+    mut level_query: Query<&mut Text, (With<LevelText>, Without<ScoreText>, Without<LivesText>, Without<TimerText>, Without<LaserText>)>,
+    mut lives_query: Query<&mut Text, (With<LivesText>, Without<ScoreText>, Without<LevelText>, Without<TimerText>, Without<LaserText>)>,
+    mut timer_query: Query<&mut Text, (With<TimerText>, Without<ScoreText>, Without<LevelText>, Without<LivesText>, Without<LaserText>)>,
+    mut laser_query: Query<&mut Text, (With<LaserText>, Without<ScoreText>, Without<LevelText>, Without<LivesText>, Without<TimerText>)>,
 ) {
     if let Ok(mut text) = score_query.get_single_mut() {
         text.sections[0].value = format!("Score: {}", score.0);
@@ -722,8 +804,16 @@ fn update_ui(
             text.sections[0].value = format!("Time: {}", level_timer.0.ceil() as i32);
         }
     }
-}
 
+    // 更新激光状态文本
+    if let Ok(mut text) = laser_query.get_single_mut() {
+        if power_effects.has_laser {
+            text.sections[0].value = format!("LASER: {:.1}s", power_effects.laser_timer);
+        } else {
+            text.sections[0].value = String::new();
+        }
+    }
+}
 // 更新关卡计时器
 fn update_level_timer(
     time: Res<Time>,
@@ -748,6 +838,7 @@ fn paddle_movement(
     mut paddle_query: Query<&mut Transform, With<Paddle>>,
     time: Res<Time>,
     power_effects: Res<PowerUpEffects>,
+    difficulty_settings: Res<DifficultySettings>,
 ) {
     if let Ok(mut transform) = paddle_query.get_single_mut() {
         let mut direction = 0.0;
@@ -763,9 +854,119 @@ fn paddle_movement(
         let half_paddle = paddle_width / 2.0;
         let boundary = WINDOW_WIDTH / 2.0 - half_paddle;
 
-        transform.translation.x += direction * PADDLE_SPEED * time.delta_seconds();
+        transform.translation.x += direction * PADDLE_SPEED * difficulty_settings.paddle_speed_modifier * time.delta_seconds();
         transform.translation.x = transform.translation.x.clamp(-boundary, boundary);
         transform.scale.x = paddle_width;
+    }
+}
+
+// 激光射击系统
+fn laser_shooting(
+    mut commands: Commands,
+    keyboard_input: Res<ButtonInput<KeyCode>>,
+    power_effects: Res<PowerUpEffects>,
+    paddle_query: Query<&Transform, With<Paddle>>,
+) {
+    if power_effects.has_laser && keyboard_input.just_pressed(KeyCode::Space) {
+        if let Ok(paddle_transform) = paddle_query.get_single() {
+            let paddle_width = PADDLE_SIZE.x * power_effects.paddle_size_modifier;
+            
+            // 从挡板两端发射激光
+            for offset in [-paddle_width / 3.0, paddle_width / 3.0] {
+                commands.spawn((
+                    SpriteBundle {
+                        sprite: Sprite {
+                            color: LASER_COLOR,
+                            ..default()
+                        },
+                        transform: Transform {
+                            translation: Vec3::new(
+                                paddle_transform.translation.x + offset,
+                                paddle_transform.translation.y + PADDLE_SIZE.y,
+                                0.0,
+                            ),
+                            scale: Vec3::new(LASER_SIZE.x, LASER_SIZE.y, 1.0),
+                            ..default()
+                        },
+                        ..default()
+                    },
+                    Laser {
+                        velocity: Vec2::new(0.0, LASER_SPEED),
+                    },
+                    GameEntity,
+                ));
+            }
+        }
+    }
+}
+
+// 激光移动系统
+fn laser_movement(
+    mut commands: Commands,
+    mut lasers: Query<(Entity, &mut Transform, &Laser)>,
+    time: Res<Time>,
+) {
+    for (entity, mut transform, laser) in lasers.iter_mut() {
+        transform.translation += laser.velocity.extend(0.0) * time.delta_seconds();
+        
+        // 如果激光超出屏幕顶部，删除它
+        if transform.translation.y > WINDOW_HEIGHT / 2.0 + 50.0 {
+            commands.entity(entity).despawn();
+        }
+    }
+}
+
+// 激光碰撞系统
+fn laser_collision(
+    mut commands: Commands,
+    lasers: Query<(Entity, &Transform), With<Laser>>,
+    mut bricks: Query<(Entity, &Transform, &mut Brick, &mut Sprite), Without<Laser>>,
+    mut score: ResMut<Score>,
+) {
+    for (laser_entity, laser_transform) in lasers.iter() {
+        for (brick_entity, brick_transform, mut brick, mut sprite) in bricks.iter_mut() {
+            if let Some(_) = collide(
+                laser_transform.translation,
+                LASER_SIZE,
+                brick_transform.translation,
+                BRICK_SIZE,
+            ) {
+                // 激光不能破坏不可破坏的砖块
+                if matches!(brick.brick_type, BrickType::Unbreakable) {
+                    commands.entity(laser_entity).despawn();
+                    break;
+                }
+
+                // 激光造成额外伤害
+                brick.health -= 2;
+
+                if brick.health <= 0 {
+                    // 销毁砖块
+                    commands.entity(brick_entity).despawn();
+                    
+                    // 增加分数
+                    match brick.brick_type {
+                        BrickType::Normal => score.0 += 15, // 激光破坏获得更多分数
+                        BrickType::Hard => score.0 += 30,
+                        _ => {}
+                    }
+
+                    // 生成粒子效果
+                    spawn_particles(&mut commands, brick_transform.translation, brick_transform.scale);
+                } else {
+                    // 更新砖块颜色表示受损
+                    sprite.color = Color::rgb(
+                        sprite.color.r() * 0.6,
+                        sprite.color.g() * 0.6,
+                        sprite.color.b() * 0.6,
+                    );
+                }
+
+                // 激光击中后消失
+                commands.entity(laser_entity).despawn();
+                break;
+            }
+        }
     }
 }
 
@@ -785,7 +986,7 @@ fn ball_movement(
 // 球碰撞检测
 fn ball_collision(
     mut commands: Commands,
-    mut ball_query: Query<(&mut Transform, &mut Ball)>,
+    mut ball_query: Query<(Entity, &mut Transform, &mut Ball)>,
     paddle_query: Query<&Transform, (With<Paddle>, Without<Ball>)>,
     mut brick_query: Query<(Entity, &Transform, &mut Brick, &mut Sprite), Without<Ball>>,
     mut score: ResMut<Score>,
@@ -796,8 +997,11 @@ fn ball_collision(
 ) {
     let paddle_transform = paddle_query.single();
     let paddle_width = PADDLE_SIZE.x * power_effects.paddle_size_modifier;
+    
+    let total_balls = ball_query.iter().count();
+    let mut balls_to_remove = Vec::new();
 
-    for (mut ball_transform, mut ball) in ball_query.iter_mut() {
+    for (ball_entity, mut ball_transform, mut ball) in ball_query.iter_mut() {
         // 墙壁碰撞
         let half_width = WINDOW_WIDTH / 2.0;
         let half_height = WINDOW_HEIGHT / 2.0;
@@ -817,16 +1021,24 @@ fn ball_collision(
 
         // 底部边界
         if ball_transform.translation.y < -half_height {
-            lives.0 = lives.0.saturating_sub(1);
-            if lives.0 == 0 {
-                next_state.set(GameState::GameOver);
+            if total_balls > 1 {
+                // 如果还有其他球，只删除这个球
+                balls_to_remove.push(ball_entity);
             } else {
-                // 重置球位置
-                ball_transform.translation = Vec3::new(0.0, -200.0, 0.0);
-                ball.velocity = Vec2::new(
-                    if rand::random() { 1.0 } else { -1.0 },
-                    1.0,
-                ).normalize() * BALL_SPEED * difficulty_settings.ball_speed_modifier;
+                // 这是最后一个球
+                if lives.0 == 1 {
+                    // 最后一条命，直接游戏结束
+                    next_state.set(GameState::GameOver);
+                } else {
+                    // 还有生命，扣除一条并重置
+                    lives.0 = lives.0.saturating_sub(1);
+                    // 重置球位置
+                    ball_transform.translation = Vec3::new(0.0, -200.0, 0.0);
+                    ball.velocity = Vec2::new(
+                        if rand::random() { 1.0 } else { -1.0 },
+                        1.0,
+                    ).normalize() * BALL_SPEED * difficulty_settings.ball_speed_modifier;
+                }
             }
         }
 
@@ -919,6 +1131,11 @@ fn ball_collision(
             }
         }
     }
+    
+    // 删除需要移除的球
+    for entity in balls_to_remove {
+        commands.entity(entity).despawn();
+    }
 }
 
 // 生成粒子效果
@@ -952,6 +1169,7 @@ fn spawn_particles(commands: &mut Commands, position: Vec3, scale: Vec3) {
                 velocity,
                 lifetime: 1.0,
             },
+            GameEntity,
         ));
     }
 }
@@ -1016,6 +1234,7 @@ fn spawn_powerup(commands: &mut Commands, position: Vec3) {
             power_type,
             velocity: Vec2::new(0.0, -150.0),
         },
+        GameEntity,
     ));
 }
 
@@ -1091,6 +1310,7 @@ fn powerup_collision(
                                     ..default()
                                 },
                                 Ball { velocity: new_velocity },
+                                GameEntity,
                             ));
                         }
                     }
@@ -1147,11 +1367,13 @@ fn check_victory(
 // 清理游戏
 fn cleanup_game(
     mut commands: Commands,
-    entities: Query<Entity, (Without<Window>, Without<Camera>)>,
+    entities: Query<Entity, With<GameEntity>>,
+    mut game_initialized: ResMut<GameInitialized>,
 ) {
     for entity in entities.iter() {
-        commands.entity(entity).despawn();
+        commands.entity(entity).despawn_recursive();
     }
+    game_initialized.0 = false;
 }
 
 // 游戏结束界面
@@ -1219,9 +1441,16 @@ fn game_over_system(
     keyboard_input: Res<ButtonInput<KeyCode>>,
     mut next_state: ResMut<NextState<GameState>>,
     mut level: ResMut<Level>,
+    mut power_effects: ResMut<PowerUpEffects>,
+    mut lives: ResMut<Lives>,
+    difficulty_settings: Res<DifficultySettings>,
 ) {
     if keyboard_input.just_pressed(KeyCode::Space) {
         level.0 = 1;
+        // 重置道具效果，避免影响下一局游戏
+        *power_effects = PowerUpEffects::default();
+        // 重置生命值
+        lives.0 = difficulty_settings.lives;
         next_state.set(GameState::MainMenu);
     }
 }
@@ -1321,8 +1550,160 @@ fn next_level_setup(
     mut level: ResMut<Level>,
     mut next_state: ResMut<NextState<GameState>>,
     mut power_effects: ResMut<PowerUpEffects>,
+    mut game_initialized: ResMut<GameInitialized>,
 ) {
     level.0 += 1;
     *power_effects = PowerUpEffects::default();
+    game_initialized.0 = false;  // 强制下一关重新初始化
     next_state.set(GameState::Playing);
+}
+
+// 暂停游戏输入检测
+fn pause_game_input(
+    keyboard_input: Res<ButtonInput<KeyCode>>,
+    mut next_state: ResMut<NextState<GameState>>,
+) {
+    if keyboard_input.just_pressed(KeyCode::Escape) {
+        next_state.set(GameState::Paused);
+    }
+}
+
+// 设置暂停菜单
+fn setup_pause_menu(mut commands: Commands) {
+    commands
+        .spawn((
+            NodeBundle {
+                style: Style {
+                    width: Val::Percent(100.0),
+                    height: Val::Percent(100.0),
+                    flex_direction: FlexDirection::Column,
+                    justify_content: JustifyContent::Center,
+                    align_items: AlignItems::Center,
+                    ..default()
+                },
+                background_color: BackgroundColor(Color::rgba(0.0, 0.0, 0.0, 0.7)),
+                z_index: ZIndex::Global(100),
+                ..default()
+            },
+            PauseUI,
+        ))
+        .with_children(|parent| {
+            parent.spawn(TextBundle::from_section(
+                "PAUSED",
+                TextStyle {
+                    font_size: 80.0,
+                    color: Color::WHITE,
+                    ..default()
+                },
+            ));
+
+            parent.spawn(TextBundle::from_section(
+                "[R] Resume Game",
+                TextStyle {
+                    font_size: 30.0,
+                    color: Color::rgb(0.2, 0.8, 0.2),
+                    ..default()
+                },
+            ).with_style(Style {
+                margin: UiRect::top(Val::Px(50.0)),
+                ..default()
+            }));
+
+            parent.spawn(TextBundle::from_section(
+                "[N] New Game",
+                TextStyle {
+                    font_size: 30.0,
+                    color: Color::rgb(0.8, 0.8, 0.2),
+                    ..default()
+                },
+            ).with_style(Style {
+                margin: UiRect::top(Val::Px(20.0)),
+                ..default()
+            }));
+
+            parent.spawn(TextBundle::from_section(
+                "[M] Main Menu",
+                TextStyle {
+                    font_size: 30.0,
+                    color: Color::rgb(0.8, 0.2, 0.2),
+                    ..default()
+                },
+            ).with_style(Style {
+                margin: UiRect::top(Val::Px(20.0)),
+                ..default()
+            }));
+
+            parent.spawn(TextBundle::from_section(
+                "Press ESC to resume",
+                TextStyle {
+                    font_size: 20.0,
+                    color: Color::rgb(0.6, 0.6, 0.6),
+                    ..default()
+                },
+            ).with_style(Style {
+                margin: UiRect::top(Val::Px(50.0)),
+                ..default()
+            }));
+        });
+}
+
+
+// 暂停菜单系统
+fn pause_menu_system(
+    keyboard_input: Res<ButtonInput<KeyCode>>,
+    mut next_state: ResMut<NextState<GameState>>,
+    mut level: ResMut<Level>,
+    mut score: ResMut<Score>,
+    mut lives: ResMut<Lives>,
+    mut power_effects: ResMut<PowerUpEffects>,
+    difficulty_settings: Res<DifficultySettings>,
+    mut game_initialized: ResMut<GameInitialized>,
+    mut commands: Commands,
+    game_entities: Query<Entity, With<GameEntity>>,
+    cameras: Query<Entity, With<Camera2d>>,
+) {
+    if keyboard_input.just_pressed(KeyCode::Escape) || keyboard_input.just_pressed(KeyCode::KeyR) {
+        // 继续游戏
+        next_state.set(GameState::Playing);
+    } else if keyboard_input.just_pressed(KeyCode::KeyN) {
+        // 重新开始游戏 - 先清理现有游戏实体
+        for entity in game_entities.iter() {
+            commands.entity(entity).despawn_recursive();
+        }
+        // 清理相机
+        for entity in cameras.iter() {
+            commands.entity(entity).despawn_recursive();
+        }
+        
+        level.0 = 1;
+        score.0 = 0;
+        lives.0 = difficulty_settings.lives;
+        *power_effects = PowerUpEffects::default();
+        game_initialized.0 = false;  // 重置初始化状态
+        next_state.set(GameState::Playing);
+    } else if keyboard_input.just_pressed(KeyCode::KeyM) {
+        // 返回主菜单 - 先清理现有游戏实体
+        for entity in game_entities.iter() {
+            commands.entity(entity).despawn_recursive();
+        }
+        // 清理相机
+        for entity in cameras.iter() {
+            commands.entity(entity).despawn_recursive();
+        }
+        
+        level.0 = 1;
+        score.0 = 0;
+        lives.0 = difficulty_settings.lives;
+        *power_effects = PowerUpEffects::default();
+        game_initialized.0 = false;  // 重置初始化状态
+        next_state.set(GameState::MainMenu);
+    }
+}
+
+
+// 清理暂停菜单
+fn cleanup_pause_menu(mut commands: Commands, query: Query<Entity, With<PauseUI>>) {
+    for entity in query.iter() {
+        commands.entity(entity).despawn_recursive();
+    }
 }
