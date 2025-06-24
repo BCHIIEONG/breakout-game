@@ -136,7 +136,7 @@ impl DifficultySettings {
     }
 }
 
-// 游戏初始化状态
+// 游戏初始化标记
 #[derive(Resource)]
 struct GameInitialized(bool);
 
@@ -325,13 +325,13 @@ fn main() {
         .add_systems(Update, victory_system.run_if(in_state(GameState::Victory)))
         .add_systems(OnExit(GameState::Victory), cleanup_victory)
         // 下一关系统
-        .add_systems(OnEnter(GameState::NextLevel), next_level_setup)
+        .add_systems(OnEnter(GameState::NextLevel), (cleanup_game, next_level_setup))
         .run();
 }
 
 // 设置主菜单
 fn setup_main_menu(mut commands: Commands, mut game_initialized: ResMut<GameInitialized>) {
-    game_initialized.0 = false; // 重置游戏初始化状态
+    game_initialized.0 = false;
     commands.spawn(Camera2dBundle::default());
 
     commands
@@ -550,7 +550,7 @@ fn setup_game(
     }
 
     // 创建相机
-    commands.spawn(Camera2dBundle::default());
+    commands.spawn((Camera2dBundle::default(), GameEntity));
 
     // 创建挡板
     commands.spawn((
@@ -995,7 +995,12 @@ fn ball_collision(
     power_effects: Res<PowerUpEffects>,
     difficulty_settings: Res<DifficultySettings>,
 ) {
-    let paddle_transform = paddle_query.single();
+    // 安全获取挡板
+    let paddle_result = paddle_query.get_single();
+    if paddle_result.is_err() {
+        return; // 如果没有挡板，直接返回
+    }
+    let paddle_transform = paddle_result.unwrap();
     let paddle_width = PADDLE_SIZE.x * power_effects.paddle_size_modifier;
     
     let total_balls = ball_query.iter().count();
@@ -1262,7 +1267,12 @@ fn powerup_collision(
     mut power_effects: ResMut<PowerUpEffects>,
     ball_query: Query<(&Transform, &Ball)>,
 ) {
-    let paddle_transform = paddle_query.single();
+    // 安全获取挡板
+    let paddle_result = paddle_query.get_single();
+    if paddle_result.is_err() {
+        return; // 如果没有挡板，直接返回
+    }
+    let paddle_transform = paddle_result.unwrap();
     let paddle_width = PADDLE_SIZE.x * power_effects.paddle_size_modifier;
 
     for (powerup_entity, powerup_transform, powerup) in powerups.iter() {
@@ -1554,7 +1564,7 @@ fn next_level_setup(
 ) {
     level.0 += 1;
     *power_effects = PowerUpEffects::default();
-    game_initialized.0 = false;  // 强制下一关重新初始化
+    game_initialized.0 = false;  // 重置初始化状态
     next_state.set(GameState::Playing);
 }
 
@@ -1647,7 +1657,6 @@ fn setup_pause_menu(mut commands: Commands) {
         });
 }
 
-
 // 暂停菜单系统
 fn pause_menu_system(
     keyboard_input: Res<ButtonInput<KeyCode>>,
@@ -1657,10 +1666,9 @@ fn pause_menu_system(
     mut lives: ResMut<Lives>,
     mut power_effects: ResMut<PowerUpEffects>,
     difficulty_settings: Res<DifficultySettings>,
-    mut game_initialized: ResMut<GameInitialized>,
     mut commands: Commands,
     game_entities: Query<Entity, With<GameEntity>>,
-    cameras: Query<Entity, With<Camera2d>>,
+    mut game_initialized: ResMut<GameInitialized>,
 ) {
     if keyboard_input.just_pressed(KeyCode::Escape) || keyboard_input.just_pressed(KeyCode::KeyR) {
         // 继续游戏
@@ -1668,10 +1676,6 @@ fn pause_menu_system(
     } else if keyboard_input.just_pressed(KeyCode::KeyN) {
         // 重新开始游戏 - 先清理现有游戏实体
         for entity in game_entities.iter() {
-            commands.entity(entity).despawn_recursive();
-        }
-        // 清理相机
-        for entity in cameras.iter() {
             commands.entity(entity).despawn_recursive();
         }
         
@@ -1686,10 +1690,6 @@ fn pause_menu_system(
         for entity in game_entities.iter() {
             commands.entity(entity).despawn_recursive();
         }
-        // 清理相机
-        for entity in cameras.iter() {
-            commands.entity(entity).despawn_recursive();
-        }
         
         level.0 = 1;
         score.0 = 0;
@@ -1699,7 +1699,6 @@ fn pause_menu_system(
         next_state.set(GameState::MainMenu);
     }
 }
-
 
 // 清理暂停菜单
 fn cleanup_pause_menu(mut commands: Commands, query: Query<Entity, With<PauseUI>>) {
