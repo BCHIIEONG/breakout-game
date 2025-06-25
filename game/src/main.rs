@@ -1,6 +1,9 @@
 use bevy::prelude::*;
 use rand::prelude::*;
 
+mod api;
+use api::{ApiClient, LeaderboardResponse};
+
 // 碰撞检测
 #[derive(Debug)]
 enum Collision {
@@ -84,6 +87,8 @@ enum GameState {
     GameOver,
     Victory,
     NextLevel,
+    EnterName,      // 新增：输入玩家名称
+    Leaderboard,    // 新增：显示排行榜
 }
 
 // 难度等级
@@ -223,6 +228,16 @@ struct PauseUI;
 #[derive(Component)]
 struct GameEntity;
 
+// 新增组件
+#[derive(Component)]
+struct EnterNameUI;
+
+#[derive(Component)]
+struct LeaderboardUI;
+
+#[derive(Component)]
+struct NameInputText;
+
 // 资源定义
 #[derive(Resource)]
 struct Score(u32);
@@ -259,6 +274,33 @@ impl Default for PowerUpEffects {
     }
 }
 
+// 新增资源
+#[derive(Resource)]
+struct PlayerName(String);
+
+#[derive(Resource)]
+struct ApiClientResource(ApiClient);
+
+#[derive(Resource)]
+struct LeaderboardData(Option<LeaderboardResponse>);
+
+#[derive(Resource)]
+struct NameInput {
+    text: String,
+    cursor_visible: bool,
+    cursor_timer: f32,
+}
+
+impl Default for NameInput {
+    fn default() -> Self {
+        Self {
+            text: String::new(),
+            cursor_visible: true,
+            cursor_timer: 0.0,
+        }
+    }
+}
+
 fn main() {
     App::new()
         .add_plugins(DefaultPlugins.set(WindowPlugin {
@@ -282,6 +324,10 @@ fn main() {
         .insert_resource(PowerUpEffects::default())
         .insert_resource(DifficultySettings::new(Difficulty::Medium))
         .insert_resource(GameInitialized(false))
+        .insert_resource(PlayerName("Player".to_string()))
+        .insert_resource(ApiClientResource(ApiClient::new()))
+        .insert_resource(LeaderboardData(None))
+        .insert_resource(NameInput::default())
         // 菜单系统
         .add_systems(OnEnter(GameState::MainMenu), setup_main_menu)
         .add_systems(Update, main_menu_system.run_if(in_state(GameState::MainMenu)))
@@ -290,6 +336,10 @@ fn main() {
         .add_systems(OnEnter(GameState::DifficultySelect), setup_difficulty_menu)
         .add_systems(Update, difficulty_menu_system.run_if(in_state(GameState::DifficultySelect)))
         .add_systems(OnExit(GameState::DifficultySelect), cleanup_difficulty_menu)
+        // 输入名称系统
+        .add_systems(OnEnter(GameState::EnterName), setup_enter_name)
+        .add_systems(Update, (enter_name_system, update_cursor).run_if(in_state(GameState::EnterName)))
+        .add_systems(OnExit(GameState::EnterName), cleanup_enter_name)
         // 游戏系统
         .add_systems(OnEnter(GameState::Playing), setup_game_conditional)
         .add_systems(
@@ -326,6 +376,10 @@ fn main() {
         .add_systems(OnExit(GameState::Victory), cleanup_victory)
         // 下一关系统
         .add_systems(OnEnter(GameState::NextLevel), (cleanup_game, next_level_setup))
+        // 排行榜系统
+        .add_systems(OnEnter(GameState::Leaderboard), setup_leaderboard)
+        .add_systems(Update, leaderboard_system.run_if(in_state(GameState::Leaderboard)))
+        .add_systems(OnExit(GameState::Leaderboard), cleanup_leaderboard)
         .run();
 }
 
@@ -373,6 +427,18 @@ fn setup_main_menu(mut commands: Commands, mut game_initialized: ResMut<GameInit
             }));
 
             parent.spawn(TextBundle::from_section(
+                "Press L to View Leaderboard",
+                TextStyle {
+                    font_size: 25.0,
+                    color: Color::rgb(0.5, 0.7, 0.9),
+                    ..default()
+                },
+            ).with_style(Style {
+                margin: UiRect::top(Val::Px(20.0)),
+                ..default()
+            }));
+
+            parent.spawn(TextBundle::from_section(
                 "Controls:\nArrow Keys or A/D: Move paddle\nSPACE: Shoot laser (when available)\nESC: Pause game\nCollect power-ups for special abilities",
                 TextStyle {
                     font_size: 20.0,
@@ -380,7 +446,7 @@ fn setup_main_menu(mut commands: Commands, mut game_initialized: ResMut<GameInit
                     ..default()
                 },
             ).with_style(Style {
-                margin: UiRect::top(Val::Px(100.0)),
+                margin: UiRect::top(Val::Px(80.0)),
                 ..default()
             }));
         });
@@ -392,7 +458,9 @@ fn main_menu_system(
     mut next_state: ResMut<NextState<GameState>>,
 ) {
     if keyboard_input.just_pressed(KeyCode::Space) {
-        next_state.set(GameState::DifficultySelect);
+        next_state.set(GameState::EnterName);  // 先输入名称
+    } else if keyboard_input.just_pressed(KeyCode::KeyL) {
+        next_state.set(GameState::Leaderboard);  // 查看排行榜
     }
 }
 
@@ -402,7 +470,6 @@ fn cleanup_main_menu(mut commands: Commands, query: Query<Entity, With<MainMenuU
         commands.entity(entity).despawn_recursive();
     }
 }
-
 // 设置难度选择菜单
 fn setup_difficulty_menu(mut commands: Commands) {
     commands
@@ -505,6 +572,163 @@ fn difficulty_menu_system(
 
 // 清理难度选择菜单
 fn cleanup_difficulty_menu(mut commands: Commands, query: Query<Entity, With<DifficultyUI>>) {
+    for entity in query.iter() {
+        commands.entity(entity).despawn_recursive();
+    }
+}
+
+// 设置输入名称界面
+fn setup_enter_name(mut commands: Commands, mut name_input: ResMut<NameInput>) {
+    name_input.text.clear();
+    name_input.cursor_visible = true;
+    name_input.cursor_timer = 0.0;
+    
+    commands
+        .spawn((
+            NodeBundle {
+                style: Style {
+                    width: Val::Percent(100.0),
+                    height: Val::Percent(100.0),
+                    flex_direction: FlexDirection::Column,
+                    justify_content: JustifyContent::Center,
+                    align_items: AlignItems::Center,
+                    ..default()
+                },
+                background_color: BackgroundColor(Color::rgb(0.1, 0.1, 0.15)),
+                ..default()
+            },
+            EnterNameUI,
+        ))
+        .with_children(|parent| {
+            parent.spawn(TextBundle::from_section(
+                "ENTER YOUR NAME",
+                TextStyle {
+                    font_size: 60.0,
+                    color: Color::WHITE,
+                    ..default()
+                },
+            ));
+            
+            // 名称输入框
+            parent
+                .spawn(NodeBundle {
+                    style: Style {
+                        width: Val::Px(400.0),
+                        height: Val::Px(60.0),
+                        margin: UiRect::top(Val::Px(50.0)),
+                        padding: UiRect::all(Val::Px(10.0)),
+                        border: UiRect::all(Val::Px(2.0)),
+                        justify_content: JustifyContent::Center,
+                        align_items: AlignItems::Center,
+                        ..default()
+                    },
+                    background_color: BackgroundColor(Color::rgb(0.2, 0.2, 0.25)),
+                    border_color: BorderColor(Color::rgb(0.5, 0.5, 0.6)),
+                    ..default()
+                })
+                .with_children(|parent| {
+                    parent.spawn((
+                        TextBundle::from_section(
+                            "",
+                            TextStyle {
+                                font_size: 40.0,
+                                color: Color::WHITE,
+                                ..default()
+                            },
+                        ),
+                        NameInputText,
+                    ));
+                });
+            
+            parent.spawn(TextBundle::from_section(
+                "Type your name and press ENTER",
+                TextStyle {
+                    font_size: 20.0,
+                    color: Color::rgb(0.6, 0.6, 0.6),
+                    ..default()
+                },
+            ).with_style(Style {
+                margin: UiRect::top(Val::Px(30.0)),
+                ..default()
+            }));
+            
+            parent.spawn(TextBundle::from_section(
+                "Press ESC to skip",
+                TextStyle {
+                    font_size: 18.0,
+                    color: Color::rgb(0.5, 0.5, 0.5),
+                    ..default()
+                },
+            ).with_style(Style {
+                margin: UiRect::top(Val::Px(10.0)),
+                ..default()
+            }));
+        });
+}
+
+// 处理名称输入
+fn enter_name_system(
+    mut char_events: EventReader<ReceivedCharacter>,
+    keyboard: Res<ButtonInput<KeyCode>>,
+    mut name_input: ResMut<NameInput>,
+    mut player_name: ResMut<PlayerName>,
+    mut next_state: ResMut<NextState<GameState>>,
+    mut text_query: Query<&mut Text, With<NameInputText>>,
+) {
+    // 处理字符输入
+    for event in char_events.read() {
+        // 将 SmolStr 转换为 char
+        if let Some(ch) = event.char.as_str().chars().next() {
+            if ch.is_alphanumeric() || ch == ' ' {
+                if name_input.text.len() < 20 {
+                    name_input.text.push(ch);
+                }
+            }
+        }
+    }
+    
+    // 处理特殊键
+    if keyboard.just_pressed(KeyCode::Backspace) && !name_input.text.is_empty() {
+        name_input.text.pop();
+    }
+    
+    if keyboard.just_pressed(KeyCode::Enter) && !name_input.text.trim().is_empty() {
+        player_name.0 = name_input.text.trim().to_string();
+        next_state.set(GameState::DifficultySelect);
+    }
+    
+    if keyboard.just_pressed(KeyCode::Escape) {
+        next_state.set(GameState::DifficultySelect);
+    }
+    
+    // 更新显示文本
+    if let Ok(mut text) = text_query.get_single_mut() {
+        let display_text = if name_input.cursor_visible {
+            format!("{}_", name_input.text)
+        } else {
+            name_input.text.clone()
+        };
+        text.sections[0].value = display_text;
+    }
+}
+
+// 更新光标闪烁
+fn update_cursor(
+    time: Res<Time>,
+    mut name_input: ResMut<NameInput>,
+) {
+    name_input.cursor_timer += time.delta_seconds();
+    if name_input.cursor_timer >= 0.5 {
+        name_input.cursor_visible = !name_input.cursor_visible;
+        name_input.cursor_timer = 0.0;
+    }
+}
+
+// 清理输入名称界面
+fn cleanup_enter_name(
+    mut commands: Commands,
+    query: Query<Entity, With<EnterNameUI>>,
+) {
     for entity in query.iter() {
         commands.entity(entity).despawn_recursive();
     }
@@ -814,6 +1038,7 @@ fn update_ui(
         }
     }
 }
+
 // 更新关卡计时器
 fn update_level_timer(
     time: Res<Time>,
@@ -1387,12 +1612,27 @@ fn cleanup_game(
 }
 
 // 游戏结束界面
-fn setup_game_over(mut commands: Commands, score: Res<Score>, difficulty_settings: Res<DifficultySettings>) {
+fn setup_game_over(
+    mut commands: Commands, 
+    score: Res<Score>, 
+    level: Res<Level>,
+    difficulty_settings: Res<DifficultySettings>,
+    player_name: Res<PlayerName>,
+    api_client: Res<ApiClientResource>,
+) {
     let difficulty_text = match difficulty_settings.difficulty {
-        Difficulty::Easy => "EASY",
-        Difficulty::Medium => "MEDIUM",
-        Difficulty::Hard => "HARD",
+        Difficulty::Easy => "Easy",
+        Difficulty::Medium => "Medium",
+        Difficulty::Hard => "Hard",
     };
+
+    // 提交分数到服务器
+    api_client.0.submit_score_async(
+        player_name.0.clone(),
+        score.0,
+        level.0,
+        difficulty_text.to_string(),
+    );
 
     commands
         .spawn((
@@ -1421,7 +1661,7 @@ fn setup_game_over(mut commands: Commands, score: Res<Score>, difficulty_setting
             ));
             
             parent.spawn(TextBundle::from_section(
-                format!("Final Score: {} ({})", score.0, difficulty_text),
+                format!("{}'s Score: {} ({})", player_name.0, score.0, difficulty_text.to_uppercase()),
                 TextStyle {
                     font_size: 40.0,
                     color: Color::WHITE,
@@ -1433,6 +1673,18 @@ fn setup_game_over(mut commands: Commands, score: Res<Score>, difficulty_setting
             }));
 
             parent.spawn(TextBundle::from_section(
+                "Score submitted to leaderboard!",
+                TextStyle {
+                    font_size: 20.0,
+                    color: Color::rgb(0.2, 0.8, 0.2),
+                    ..default()
+                },
+            ).with_style(Style {
+                margin: UiRect::top(Val::Px(20.0)),
+                ..default()
+            }));
+
+            parent.spawn(TextBundle::from_section(
                 "Press SPACE to return to menu",
                 TextStyle {
                     font_size: 25.0,
@@ -1440,7 +1692,19 @@ fn setup_game_over(mut commands: Commands, score: Res<Score>, difficulty_setting
                     ..default()
                 },
             ).with_style(Style {
-                margin: UiRect::top(Val::Px(50.0)),
+                margin: UiRect::top(Val::Px(40.0)),
+                ..default()
+            }));
+
+            parent.spawn(TextBundle::from_section(
+                "Press L to view leaderboard",
+                TextStyle {
+                    font_size: 20.0,
+                    color: Color::rgb(0.5, 0.7, 0.9),
+                    ..default()
+                },
+            ).with_style(Style {
+                margin: UiRect::top(Val::Px(15.0)),
                 ..default()
             }));
         });
@@ -1457,11 +1721,11 @@ fn game_over_system(
 ) {
     if keyboard_input.just_pressed(KeyCode::Space) {
         level.0 = 1;
-        // 重置道具效果，避免影响下一局游戏
         *power_effects = PowerUpEffects::default();
-        // 重置生命值
         lives.0 = difficulty_settings.lives;
         next_state.set(GameState::MainMenu);
+    } else if keyboard_input.just_pressed(KeyCode::KeyL) {
+        next_state.set(GameState::Leaderboard);
     }
 }
 
@@ -1702,6 +1966,274 @@ fn pause_menu_system(
 
 // 清理暂停菜单
 fn cleanup_pause_menu(mut commands: Commands, query: Query<Entity, With<PauseUI>>) {
+    for entity in query.iter() {
+        commands.entity(entity).despawn_recursive();
+    }
+}
+
+// 设置排行榜界面
+fn setup_leaderboard(
+    mut commands: Commands,
+    api_client: Res<ApiClientResource>,
+    mut leaderboard_data: ResMut<LeaderboardData>,
+    difficulty_settings: Res<DifficultySettings>,
+) {
+    // 获取排行榜数据
+    let difficulty_filter = match difficulty_settings.difficulty {
+        Difficulty::Easy => "Easy",
+        Difficulty::Medium => "Medium",
+        Difficulty::Hard => "Hard",
+    };
+    
+    // 尝试从API获取数据
+    match api_client.0.get_leaderboard(Some(10), Some(difficulty_filter)) {
+        Ok(data) => {
+            leaderboard_data.0 = Some(data);
+        }
+        Err(e) => {
+            eprintln!("Failed to fetch leaderboard: {}", e);
+            leaderboard_data.0 = None;
+        }
+    }
+    
+    commands
+        .spawn((
+            NodeBundle {
+                style: Style {
+                    width: Val::Percent(100.0),
+                    height: Val::Percent(100.0),
+                    flex_direction: FlexDirection::Column,
+                    justify_content: JustifyContent::Center,
+                    align_items: AlignItems::Center,
+                    ..default()
+                },
+                background_color: BackgroundColor(Color::rgb(0.1, 0.1, 0.15)),
+                ..default()
+            },
+            LeaderboardUI,
+        ))
+        .with_children(|parent| {
+            parent.spawn(TextBundle::from_section(
+                format!("LEADERBOARD - {}", difficulty_filter.to_uppercase()),
+                TextStyle {
+                    font_size: 60.0,
+                    color: Color::WHITE,
+                    ..default()
+                },
+            ));
+            
+            // 排行榜容器
+            parent
+                .spawn(NodeBundle {
+                    style: Style {
+                        width: Val::Px(600.0),
+                        height: Val::Px(400.0),
+                        margin: UiRect::top(Val::Px(40.0)),
+                        padding: UiRect::all(Val::Px(20.0)),
+                        flex_direction: FlexDirection::Column,
+                        ..default()
+                    },
+                    background_color: BackgroundColor(Color::rgba(0.2, 0.2, 0.25, 0.8)),
+                    ..default()
+                })
+                .with_children(|parent| {
+                    // 表头
+                    parent
+                        .spawn(NodeBundle {
+                            style: Style {
+                                width: Val::Percent(100.0),
+                                height: Val::Px(40.0),
+                                justify_content: JustifyContent::SpaceBetween,
+                                align_items: AlignItems::Center,
+                                padding: UiRect::horizontal(Val::Px(10.0)),
+                                margin: UiRect::bottom(Val::Px(10.0)),
+                                ..default()
+                            },
+                            ..default()
+                        })
+                        .with_children(|parent| {
+                            parent.spawn(TextBundle::from_section(
+                                "RANK",
+                                TextStyle {
+                                    font_size: 20.0,
+                                    color: Color::rgb(0.7, 0.7, 0.7),
+                                    ..default()
+                                },
+                            ).with_style(Style {
+                                width: Val::Px(60.0),
+                                ..default()
+                            }));
+                            
+                            parent.spawn(TextBundle::from_section(
+                                "NAME",
+                                TextStyle {
+                                    font_size: 20.0,
+                                    color: Color::rgb(0.7, 0.7, 0.7),
+                                    ..default()
+                                },
+                            ).with_style(Style {
+                                width: Val::Px(200.0),
+                                ..default()
+                            }));
+                            
+                            parent.spawn(TextBundle::from_section(
+                                "SCORE",
+                                TextStyle {
+                                    font_size: 20.0,
+                                    color: Color::rgb(0.7, 0.7, 0.7),
+                                    ..default()
+                                },
+                            ).with_style(Style {
+                                width: Val::Px(100.0),
+                                ..default()
+                            }));
+                            
+                            parent.spawn(TextBundle::from_section(
+                                "LEVEL",
+                                TextStyle {
+                                    font_size: 20.0,
+                                    color: Color::rgb(0.7, 0.7, 0.7),
+                                    ..default()
+                                },
+                            ).with_style(Style {
+                                width: Val::Px(60.0),
+                                ..default()
+                            }));
+                        });
+                    
+                    // 排行榜数据
+                    if let Some(ref data) = leaderboard_data.0 {
+                        for score in &data.scores {
+                            parent
+                                .spawn(NodeBundle {
+                                    style: Style {
+                                        width: Val::Percent(100.0),
+                                        height: Val::Px(35.0),
+                                        justify_content: JustifyContent::SpaceBetween,
+                                        align_items: AlignItems::Center,
+                                        padding: UiRect::horizontal(Val::Px(10.0)),
+                                        margin: UiRect::bottom(Val::Px(5.0)),
+                                        ..default()
+                                    },
+                                    background_color: BackgroundColor(
+                                        if score.rank == Some(1) {
+                                            Color::rgba(0.8, 0.7, 0.0, 0.2)
+                                        } else if score.rank == Some(2) {
+                                            Color::rgba(0.7, 0.7, 0.7, 0.2)
+                                        } else if score.rank == Some(3) {
+                                            Color::rgba(0.7, 0.4, 0.0, 0.2)
+                                        } else {
+                                            Color::rgba(0.3, 0.3, 0.35, 0.3)
+                                        }
+                                    ),
+                                    ..default()
+                                })
+                                .with_children(|parent| {
+                                    // Rank
+                                    parent.spawn(TextBundle::from_section(
+                                        format!("#{}", score.rank.unwrap_or(0)),
+                                        TextStyle {
+                                            font_size: 24.0,
+                                            color: if score.rank == Some(1) {
+                                                Color::rgb(1.0, 0.85, 0.0)
+                                            } else if score.rank == Some(2) {
+                                                Color::rgb(0.75, 0.75, 0.75)
+                                            } else if score.rank == Some(3) {
+                                                Color::rgb(0.8, 0.5, 0.2)
+                                            } else {
+                                                Color::WHITE
+                                            },
+                                            ..default()
+                                        },
+                                    ).with_style(Style {
+                                        width: Val::Px(60.0),
+                                        ..default()
+                                    }));
+                                    
+                                    // Name
+                                    parent.spawn(TextBundle::from_section(
+                                        &score.player_name,
+                                        TextStyle {
+                                            font_size: 22.0,
+                                            color: Color::WHITE,
+                                            ..default()
+                                        },
+                                    ).with_style(Style {
+                                        width: Val::Px(200.0),
+                                        ..default()
+                                    }));
+                                    
+                                    // Score
+                                    parent.spawn(TextBundle::from_section(
+                                        score.score.to_string(),
+                                        TextStyle {
+                                            font_size: 24.0,
+                                            color: Color::rgb(0.2, 0.8, 0.2),
+                                            ..default()
+                                        },
+                                    ).with_style(Style {
+                                        width: Val::Px(100.0),
+                                        ..default()
+                                    }));
+                                    
+                                    // Level
+                                    parent.spawn(TextBundle::from_section(
+                                        score.level.to_string(),
+                                        TextStyle {
+                                            font_size: 22.0,
+                                            color: Color::rgb(0.7, 0.7, 0.7),
+                                            ..default()
+                                        },
+                                    ).with_style(Style {
+                                        width: Val::Px(60.0),
+                                        ..default()
+                                    }));
+                                });
+                        }
+                    } else {
+                        parent.spawn(TextBundle::from_section(
+                            "Failed to load leaderboard data.\nMake sure the server is running.",
+                            TextStyle {
+                                font_size: 20.0,
+                                color: Color::rgb(0.8, 0.2, 0.2),
+                                ..default()
+                            },
+                        ).with_style(Style {
+                            margin: UiRect::top(Val::Px(50.0)),
+                            ..default()
+                        }));
+                    }
+                });
+            
+            parent.spawn(TextBundle::from_section(
+                "Press SPACE to return to menu",
+                TextStyle {
+                    font_size: 25.0,
+                    color: Color::rgb(0.7, 0.7, 0.7),
+                    ..default()
+                },
+            ).with_style(Style {
+                margin: UiRect::top(Val::Px(40.0)),
+                ..default()
+            }));
+        });
+}
+
+// 排行榜系统
+fn leaderboard_system(
+    keyboard_input: Res<ButtonInput<KeyCode>>,
+    mut next_state: ResMut<NextState<GameState>>,
+) {
+    if keyboard_input.just_pressed(KeyCode::Space) {
+        next_state.set(GameState::MainMenu);
+    }
+}
+
+// 清理排行榜界面
+fn cleanup_leaderboard(
+    mut commands: Commands,
+    query: Query<Entity, With<LeaderboardUI>>,
+) {
     for entity in query.iter() {
         commands.entity(entity).despawn_recursive();
     }
